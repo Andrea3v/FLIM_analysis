@@ -1,0 +1,10 @@
+results/
+test_data/
+test_code/
+__pycache__/
+.claude/
+*.tif
+*.tiff
+*.pyc
+AnalyzeTCSPC.py
+FastFLIM_mod_AT0.ipynb
