@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
 
-def FastFLIM_mod_AT0(filename, tag, tim, thresh, lims):
+def FastFLIM_mod_AT0(filename, tag, tim, thresh, lims, show=True):
     """
     Create a false-colour FLIM image from photon-count and lifetime maps.
 
@@ -136,7 +136,11 @@ def FastFLIM_mod_AT0(filename, tag, tim, thresh, lims):
             suffix = f'_ch{ch}' if tim.shape[2] > 1 else ''
             plt.savefig(filename + suffix + '_LTimg.png',
                         dpi=150, bbox_inches='tight', facecolor='k')
-        plt.show()
+
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
 
     # ── 5. Colorbar strip (n_colors × 10 × 3) ─────────────────────────────────
     A = np.repeat(spectrum[:, np.newaxis, :], 10, axis=1)

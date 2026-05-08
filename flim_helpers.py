@@ -8,8 +8,11 @@ uplowthresh        -- percentile-based display thresholds from pixel histogram
 Fit_decay          -- multi-exponential decay fitting (grid search + Nelder-Mead)
 Calc_Phasor_Mat    -- phasor G/S components + 2-D density matrix
 phasor_ref_correction -- instrument correction via known-lifetime reference standard
+read_fbs_metadata  -- parse ISS Vista .fbs.xml acquisition metadata
 """
 
+import re
+import xml.etree.ElementTree as ET
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -343,3 +346,104 @@ def phasor_ref_correction(g_sample, s_sample, g_ref, s_ref, tau_ref_ns, freq_mhz
         tau_phi = np.where(tau_phi > 0, tau_phi, np.nan)
 
     return g_corr, s_corr, tau_mod, tau_phi
+
+
+def read_fbs_metadata(xml_path):
+    """
+    Parse an ISS Vista .fbs.xml file and return relevant acquisition parameters.
+
+    Parameters
+    ----------
+    xml_path : str  path to the .fbs.xml file
+
+    Returns
+    -------
+    dict with keys:
+        datetime       : str    acquisition timestamp
+        nx, ny, nz     : int    image dimensions (pixels)
+        channels       : int    number of detection channels
+        nbin           : int    TCSPC time bins  (AdcResolution)
+        Tcycle         : float  laser repetition period (ns)  — use as Tcycle
+        freq_mhz       : float  laser repetition frequency (MHz)
+        dt             : float  time bin width (ns)  = Tcycle / nbin
+        dwell_time_ms  : float  pixel dwell time (ms)
+        pixel_size_um  : float  lateral pixel size (µm/px)
+        z_step_um      : float  axial step between slices (µm); 0 if single plane
+        scan_plane     : str    e.g. 'XY'
+        excitation_nm  : int or None   laser wavelength (nm)
+        detector_gain  : int or None   detector gain (%)
+    """
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    def _get(path, cast=str, default=None):
+        el = root.find(path)
+        if el is None or el.text is None:
+            return default
+        try:
+            return cast(el.text.strip())
+        except (ValueError, TypeError):
+            return default
+
+    # ── spatial & scan params ────────────────────────────────────────────────
+    nx = _get('ScanParams/XPixels', int)
+    ny = _get('ScanParams/YPixels', int)
+    nz = _get('ScanParams/ZPixels', int, default=1)
+
+    x_start = _get('ScanParams/ImageRegion/XStart', float, 0.0)
+    x_end   = _get('ScanParams/ImageRegion/XEnd',   float, 0.0)
+    y_start = _get('ScanParams/ImageRegion/YStart', float, 0.0)
+    y_end   = _get('ScanParams/ImageRegion/YEnd',   float, 0.0)
+    z_start = _get('ScanParams/ImageRegion/ZStart', float, 0.0)
+    z_end   = _get('ScanParams/ImageRegion/ZEnd',   float, 0.0)
+
+    pixel_size_um = (x_end - x_start) / nx if nx else None
+    z_step_um     = (z_end - z_start) / (nz - 1) if nz and nz > 1 else 0.0
+
+    # ── TCSPC params ─────────────────────────────────────────────────────────
+    nbin   = _get('PhotonCountingSettings/AdcResolution',       int)
+    Tcycle = _get('PhotonCountingSettings/TacTimeRange',        float)   # ns
+    macro_freq = _get('PhotonCountingSettings/MacroTimeClockFrequency', float)
+
+    freq_mhz = macro_freq / 1e6 if macro_freq else (1000.0 / Tcycle if Tcycle else None)
+    dt       = Tcycle / nbin if (Tcycle and nbin) else None
+
+    # ── other acquisition params ─────────────────────────────────────────────
+    dwell_time_ms = _get('ScanParams/PixelDwellTime', float)
+    channels      = _get('ScanParams/Channels',       int)
+    scan_plane    = _get('ScanParams/ScannerInfo/FrameScanPlane', str)
+    datetime_str  = _get('DateTimeStamp', str)
+
+    # ── optional: parse laser wavelength and gain from free-text comments ────
+    excitation_nm = None
+    detector_gain = None
+    for el in root.findall('ItemizedSystemSettings/fromComments'):
+        text = (el.text or '').strip()
+        if excitation_nm is None:
+            m = re.search(r'Wavelength.*?:\s*(\d+)\s*nm', text)
+            if m:
+                excitation_nm = int(m.group(1))
+        if detector_gain is None:
+            m = re.search(r'Gain\s*-.*?:\s*(\d+)\s*%', text)
+            if m:
+                detector_gain = int(m.group(1))
+
+    return {
+        'datetime':      datetime_str,
+        'nx':            nx,
+        'ny':            ny,
+        'nz':            nz,
+        'channels':      channels,
+        'nbin':          nbin,
+        'Tcycle':        Tcycle,
+        'freq_mhz':      freq_mhz,
+        'dt':            dt,
+        'dwell_time_ms': dwell_time_ms,
+        'pixel_size_um': pixel_size_um,
+        'z_step_um':     z_step_um,
+        'scan_plane':    scan_plane,
+        'excitation_nm': excitation_nm,
+        'detector_gain': detector_gain,
+    }
+
+
