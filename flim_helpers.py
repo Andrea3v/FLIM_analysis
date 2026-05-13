@@ -59,17 +59,23 @@ def uplowthresh(img, upLim, loLim):
     return hi, low
 
 
-def Fit_decay(IRF, y, Trep, dt):
+def Fit_decay(IRF, y, Trep, dt, max_components=3, t_stop_ns=None):
     """
     Multi-exponential TCSPC decay fit via grid search + cascade Nelder-Mead.
     Mirrors Fit_decay.m; replaces Simplex/Convol/lsqnonneg with scipy equivalents.
 
     Parameters
     ----------
-    IRF  : raw IRF trace (1-D)
-    y    : measured decay to fit (1-D)
-    Trep : laser repetition period (ns)
-    dt   : time bin width (ns)
+    IRF           : raw IRF trace (1-D)
+    y             : measured decay to fit (1-D)
+    Trep          : laser repetition period (ns)
+    dt            : time bin width (ns)
+    max_components: hard cap on the number of exponential components returned
+                    by the grid search (default 3). Prevents overfitting with
+                    spurious slow components that inflate amplitude-weighted LT.
+    t_stop_ns     : if set (ns), the chi² objective is evaluated only over bins
+                    up to this time, excluding any artefact bump beyond it
+                    (e.g. a reflection peak at ~5 ns).  None = use full window.
 
     Returns
     -------
@@ -91,7 +97,7 @@ def Fit_decay(IRF, y, Trep, dt):
         idx_c = np.mod(t - int(np.ceil(c)),  n)
         return (1 - c + np.floor(c)) * M[idx_f] + (c - np.floor(c)) * M[idx_c]
 
-    exp_tp = np.exp(-tp[:, np.newaxis] / tau_grid[np.newaxis, :])
+    exp_tp = np.exp(-tp[:, np.newaxis] * tau_grid[np.newaxis, :])
     if len(tp) != n:
         tmp2 = np.zeros((n, 126))
         tmp2[:min(len(tp), n)] = exp_tp[:min(len(tp), n)]
@@ -100,16 +106,20 @@ def Fit_decay(IRF, y, Trep, dt):
     cs  = M0.sum(axis=0); cs[cs == 0] = 1.0
     M0 /= cs
 
+    # objective window — applied to BOTH grid search and Nelder-Mead
+    _n_stop = int(round(t_stop_ns / dt)) if t_stop_ns is not None else n
+    _n_stop = max(1, min(_n_stop, n))
+
     c_grid   = np.arange(-5, 5.5, 0.5)
     err_grid = np.zeros(len(c_grid))
     for ki, ck in enumerate(c_grid):
         M     = frac_shift(M0, ck)
         cc    = int(np.ceil(abs(ck))) * int(np.sign(ck))
-        sl    = slice(max(0, cc), min(n, n + cc))
+        sl    = slice(max(0, cc), min(_n_stop, n + cc))
         cx, _ = nnls(M[sl], y[sl])
         z_k   = M @ cx
-        denom = np.abs(z_k); denom[denom == 0] = 1.0
-        err_grid[ki] = np.sum((z_k - y) ** 2 / denom) / n
+        denom = np.abs(z_k[:_n_stop]); denom[denom == 0] = 1.0
+        err_grid[ki] = np.sum((z_k[:_n_stop] - y[:_n_stop]) ** 2 / denom) / _n_stop
 
     c_fine   = np.arange(-5, 5.05, 0.1)
     err_fine = pchip_interpolate(c_grid, err_grid, c_fine)
@@ -117,7 +127,7 @@ def Fit_decay(IRF, y, Trep, dt):
 
     M   = frac_shift(M0, c_best)
     cc  = int(np.ceil(abs(c_best))) * int(np.sign(c_best))
-    sl  = slice(max(0, cc), min(n, n + cc))
+    sl  = slice(max(0, cc), min(_n_stop, n + cc))
     cx, _ = nnls(M[sl], y[sl])
 
     cx_comp = cx[1:]
@@ -129,7 +139,7 @@ def Fit_decay(IRF, y, Trep, dt):
     if active[-1]: t2_list = t2_list + [len(active) - 1]
     while t1_list and t2_list and t1_list[0]  > t2_list[0]:  t2_list.pop(0)
     while t1_list and t2_list and t1_list[-1] > t2_list[-1]: t1_list.pop()
-    n_grp = min(len(t1_list), len(t2_list))
+    n_grp = min(len(t1_list), len(t2_list), max_components)
     t1_list, t2_list = t1_list[:n_grp], t2_list[:n_grp]
 
     tau_guess = []
@@ -138,7 +148,7 @@ def Fit_decay(IRF, y, Trep, dt):
         if w.sum() > 0:
             tau_guess.append(np.dot(w, tau_grid[s:e + 1]) / w.sum())
 
-    tau_init = np.array([0.1] + sorted(g / dt for g in tau_guess)) / dt
+    tau_init = np.array([0.1 / dt] + sorted(1.0 / (g * dt) for g in tau_guess))
     m        = len(tau_init)
     tp2      = np.arange(1, n + 1, dtype=float)
     paramin  = np.concatenate([[-1.0 / dt], 0.25 * tau_init])
@@ -156,10 +166,10 @@ def Fit_decay(IRF, y, Trep, dt):
         z_    = np.hstack([np.ones((n, 1)), _convol(irs, x_)])
         cs    = z_.sum(axis=0); cs[cs == 0] = 1.0
         z_   /= cs
-        A_, _ = nnls(z_, y)
+        A_, _ = nnls(z_[:_n_stop], y[:_n_stop])
         zfit  = z_ @ A_
-        denom = np.abs(zfit); denom[denom == 0] = 1.0
-        return np.sum((y - zfit) ** 2 / denom) / (n - m)
+        denom = np.abs(zfit[:_n_stop]); denom[denom == 0] = 1.0
+        return np.sum((y[:_n_stop] - zfit[:_n_stop]) ** 2 / denom) / (_n_stop - m)
 
     rng0       = np.random.default_rng(0)
     best_param = np.concatenate([[0.0], tau_init])
@@ -196,9 +206,10 @@ def Fit_decay(IRF, y, Trep, dt):
     z_f    = np.hstack([np.ones((n, 1)), _convol(irs_f, x_f)])
     cs     = z_f.sum(axis=0); cs[cs == 0] = 1.0
     z_f   /= cs
-    A_f, _ = nnls(z_f, y)
+    A_f, _ = nnls(z_f[:_n_stop], y[:_n_stop])
     model  = z_f @ A_f
-    chi2   = np.sum((y - model) ** 2 / np.maximum(np.abs(model), 1e-12)) / (n - m)
+    chi2   = np.sum((y[:_n_stop] - model[:_n_stop]) ** 2 /
+                    np.maximum(np.abs(model[:_n_stop]), 1e-12)) / (_n_stop - m)
 
     return dt * tau_f, A_f[1:], float(A_f[0]) / n, model, chi2, model
 
