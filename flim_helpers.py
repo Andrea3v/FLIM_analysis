@@ -6,13 +6,18 @@ Functions
 ---------
 uplowthresh        -- percentile-based display thresholds from pixel histogram
 Fit_decay          -- multi-exponential decay fitting (grid search + Nelder-Mead)
-Calc_Phasor_Mat    -- phasor G/S components + 2-D density matrix
+fit_decays         -- Fit_decay on many decays in parallel worker processes
+Calc_Phasor_Mat   -- phasor G/S components + 2-D density matrix
 phasor_ref_correction -- instrument correction via known-lifetime reference standard
 read_fbs_metadata  -- parse ISS Vista .fbs.xml acquisition metadata
 """
 
+import os
 import re
+import time
+import functools
 import xml.etree.ElementTree as ET
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -212,6 +217,51 @@ def Fit_decay(IRF, y, Trep, dt, max_components=3, t_stop_ns=None):
                     np.maximum(np.abs(model[:_n_stop]), 1e-12)) / (_n_stop - m)
 
     return dt * tau_f, A_f[1:], float(A_f[0]) / n, model, chi2, model
+
+
+def _fit_row(IRF, Trep, dt, max_components, t_stop_ns, y):
+    # worker task of fit_decays (module level, so the spawned processes can import it)
+    return Fit_decay(IRF, y, Trep, dt, max_components=max_components, t_stop_ns=t_stop_ns)[:5]
+
+
+def fit_decays(IRF, decays, Trep, dt, max_components=3, t_stop_ns=None, n_workers=None, verbose=True):
+    """
+    Fit_decay on every row of `decays` (n, nbin), spread over worker processes.
+
+    Results are identical to calling Fit_decay row by row (its random restarts use a fixed seed),
+    and come back in row order. n_workers: None = all logical cores but one; 1 = sequential, in this process.
+    Prints progress about every 10 % when verbose.
+
+    Returns
+    -------
+    list of (tau (ns), amp, off, model, chi2) per row
+    """
+    decays = np.asarray(decays, dtype=float)
+    if decays.size == 0:
+        return []
+    decays = decays.reshape(-1, decays.shape[-1])
+    n = len(decays)
+    n_workers = max(1, min(n, n_workers or (os.cpu_count() or 2) - 1))
+    task = functools.partial(_fit_row, np.asarray(IRF, dtype=float), Trep, dt, max_components, t_stop_ns)
+    out, t0, step = [None] * n, time.perf_counter(), max(1, n // 10)
+
+    def _progress(done):
+        if verbose and (done % step == 0 or done == n):
+            el = time.perf_counter() - t0
+            left = f'  ~{el / done * (n - done) / 60:.1f} min left' if done < n else ''
+            print(f'  fitted {done}/{n}  ({el:.0f} s{left})', end='\n' if done == n else '\r', flush=True)
+
+    if n_workers == 1:
+        for i, y in enumerate(decays):
+            out[i] = task(y)
+            _progress(i + 1)
+        return out
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        futs = {ex.submit(task, y): i for i, y in enumerate(decays)}
+        for done, f in enumerate(as_completed(futs), 1):
+            out[futs[f]] = f.result()
+            _progress(done)
+    return out
 
 
 def Calc_Phasor_Mat(IRF2, Data, Trep, dt, wdth, fname, min_count=10, spatial_bin=1):
