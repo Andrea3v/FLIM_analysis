@@ -7,6 +7,8 @@ Functions
 uplowthresh        -- percentile-based display thresholds from pixel histogram
 Fit_decay          -- multi-exponential decay fitting (grid search + Nelder-Mead)
 fit_decays         -- Fit_decay on many decays in parallel worker processes
+pooled_lifetimes   -- intensity- / amplitude-weighted mean lifetimes of one (pooled) Fit_decay
+fit_irf_width      -- rescale a stored IRF's width to a recording (IRF from another session)
 Calc_Phasor_Mat   -- phasor G/S components + 2-D density matrix
 phasor_ref_correction -- instrument correction via known-lifetime reference standard
 read_fbs_metadata  -- parse ISS Vista .fbs.xml acquisition metadata
@@ -217,6 +219,132 @@ def Fit_decay(IRF, y, Trep, dt, max_components=3, t_stop_ns=None):
                     np.maximum(np.abs(model[:_n_stop]), 1e-12)) / (_n_stop - m)
 
     return dt * tau_f, A_f[1:], float(A_f[0]) / n, model, chi2, model
+
+
+def pooled_lifetimes(IRF, y, Trep, dt, t_stop_ns=None, max_components=3, fast_ns=0.1, fit=None):
+    """
+    Lifetime summary of one Fit_decay on a pooled decay (e.g. all cells of a z-stack or of one timepoint).
+
+    Fit_decay scales every component curve to unit area, so its `amp` is the number of photons per component:
+      tau_int = sum(n_i tau_i) / sum(n_i)                      intensity-weighted mean lifetime
+      tau_amp = sum(a_i tau_i) / sum(a_i),  a_i = n_i (1 - exp(-dt / tau_i))   amplitude-weighted mean lifetime
+    (a_i is exact for Fit_decay's periodic exponentials: a unit-amplitude one has area IRF area / (1 - exp(-dt/tau)).)
+    Components shorter than fast_ns are IRF-shaped (on the 2026-11 brain-slice data: an IRF broader than the
+    recording's); they are left out of both means and their photon share is returned as fast_frac.
+
+    fit : an existing Fit_decay result (tau, amp, off, model, chi2, ...) to summarise instead of fitting y.
+    Returns a flat dict: tau_int, tau_amp, fast_frac, chi2, tau1.. / frac1.. (slow components, sorted, photon
+    fractions of the slow photons) and model (the fitted curve).
+    """
+    if fit is None:
+        fit = Fit_decay(IRF, y, Trep, dt, max_components=max_components, t_stop_ns=t_stop_ns)
+    tau, amp, _, model, chi2 = fit[:5]
+    tau = np.asarray(tau, dtype=float).ravel()
+    amp = np.clip(np.asarray(amp, dtype=float).ravel(), 0.0, None)
+    slow = (tau >= fast_ns) & (amp > 0)
+    out = dict(tau_int=np.nan, tau_amp=np.nan,
+               fast_frac=float(amp[~slow].sum() / amp.sum()) if amp.sum() > 0 else np.nan,
+               chi2=float(chi2))
+    if slow.any():
+        n, t = amp[slow], tau[slow]
+        a = n * (1.0 - np.exp(-dt / t))
+        out.update(tau_int=float(n @ t / n.sum()), tau_amp=float(a @ t / a.sum()))
+        for i, k in enumerate(np.argsort(t), 1):
+            out[f'tau{i}'] = float(t[k])
+            out[f'frac{i}'] = float(n[k] / n.sum())
+    out['model'] = np.asarray(model, dtype=float)
+    return out
+
+
+def fit_irf_width(IRF, y, dt, win_ns=3.0, tail_ns=2.5, n_exp=2, s_bounds=(0.3, 2.0), min_gain=0.2):
+    """
+    Rescale the width of a stored IRF to the instrument response of a recording.
+
+    A stored IRF (other day, other settings, or without its .fbs.xml) can be broader or narrower than the response
+    in the data. On the 2026-11-10 brain slices the urea-SHG IRFs of 2 and 6 Nov were too broad (fitted factor
+    0.54-0.66): the data rose faster than any decay convolved with them, and Fit_decay compensated with a ~0.025 ns
+    component holding ~9 % of the photons.
+
+    Model, on the bins up to `win_ns` after the peak of y (a reflection bump further out does not enter):
+        y = background + sum_k A_k * (IRF_s,c  (x) periodic exp(-t / tau_k)),   k = 1..n_exp
+    with IRF_s,c the IRF stretched in time by s about its (sub-bin) peak and shifted by c bins. The lifetimes, A_k
+    and the background are nuisance parameters (A by NNLS); s, c and tau_k by Nelder-Mead from several starts.
+    The IRF is first cut to +-tail_ns around its peak (removes its echoes and baseline). The same fit with s = 1
+    gives the chi2 of the measured IRF.
+
+    IRF, y : 1-D, same bins (dt ns), peaks near each other (e.g. both aligned to the same target bin).
+    Returns dict:
+        s, c                       : width factor (< 1: narrower) and shift (bins) of the best fit
+        chi2_measured, chi2_fitted : reduced Pearson chi2 with s = 1 and with the fitted s
+        apply                      : chi2_fitted < (1 - min_gain) * chi2_measured
+        irf                        : the IRF rescaled by s about its own peak (shift NOT applied), same area
+        irf_measured               : the cut IRF with s = 1
+        stop                       : fit window = bins [0, stop)
+        model_measured, model_fitted : fitted curves (full length) for a QC plot
+        taus                       : nuisance lifetimes (ns) of the fitted model
+    """
+    y = np.asarray(y, dtype=float).ravel()
+    n = y.size
+    T = np.arange(n, dtype=float)
+    ir = np.asarray(IRF, dtype=float).ravel()[:n].copy()
+    ir -= np.median(ir[-25:])
+    pk = int(np.argmax(ir))
+    ir[np.abs(T - pk) > tail_ns / dt] = 0.0
+    ir = np.clip(ir, 0.0, None)
+    a, b, c3 = ir[pk - 1], ir[pk], ir[(pk + 1) % n]
+    den = a - 2 * b + c3
+    tpk = pk + (0.5 * (a - c3) / den if den != 0 else 0.0)        # sub-bin peak (parabola through the top 3 bins)
+    fine = np.arange(n * 10) / 10.0
+    src = np.interp(fine, T, ir)
+    area = ir.sum()
+
+    def irf_sc(s, c):
+        out = np.interp((T - tpk - c) / s + tpk, fine, src, left=0.0, right=0.0)
+        return out * (area / out.sum()) if out.sum() > 0 else out
+
+    stop = min(n, int(np.argmax(y)) + int(round(win_ns / dt)) + 1)
+
+    def model(s, c, taus):
+        h = np.fft.rfft(irf_sc(s, c))
+        cols = [np.ones(n)]
+        for tau in taus:
+            x = np.exp(-T * dt / tau) / (1.0 - np.exp(-n * dt / tau))
+            cols.append(np.fft.irfft(h * np.fft.rfft(x), n=n))
+        M = np.array(cols).T
+        M /= np.maximum(M[:stop].sum(axis=0), 1e-12)
+        A, _ = nnls(M[:stop], y[:stop])
+        return M @ A
+
+    def chi2(p, s_fixed):
+        c = p[0]
+        s = s_fixed if s_fixed is not None else p[1]
+        taus = 0.05 + np.abs(p[-n_exp:])
+        if not (s_bounds[0] < s < s_bounds[1]) or abs(c) > 10:
+            return 1e12
+        z = model(s, c, taus)
+        return float(np.sum((y[:stop] - z[:stop]) ** 2 / np.maximum(z[:stop], 1.0)) / max(1, stop - n_exp - 3))
+
+    tau0 = list(np.linspace(0.5, 2.5, n_exp))
+    res = {}
+    for key, s_fixed in (('measured', 1.0), ('fitted', None)):
+        s_starts = (1.0,) if s_fixed is not None else (0.6, 0.8, 1.0, 1.3)
+        best = None
+        for c0 in (-1.0, 0.0, 1.0):
+            for s0 in s_starts:
+                x0 = [c0] + ([s0] if s_fixed is None else []) + tau0
+                r = minimize(chi2, x0, args=(s_fixed,), method='Nelder-Mead',
+                             options={'maxiter': 3000, 'xatol': 1e-5, 'fatol': 1e-7})
+                if best is None or r.fun < best.fun:
+                    best = r
+        s = s_fixed if s_fixed is not None else float(best.x[1])
+        taus = 0.05 + np.abs(best.x[-n_exp:])
+        res[key] = dict(chi2=float(best.fun), s=float(s), c=float(best.x[0]), taus=taus,
+                        model=model(s, best.x[0], taus))
+    f, m = res['fitted'], res['measured']
+    return dict(s=f['s'], c=f['c'], chi2_measured=m['chi2'], chi2_fitted=f['chi2'],
+                apply=bool(f['chi2'] < (1.0 - min_gain) * m['chi2']),
+                irf=irf_sc(f['s'], 0.0), irf_measured=ir, stop=stop,
+                model_measured=m['model'], model_fitted=f['model'], taus=f['taus'])
 
 
 def _fit_row(IRF, Trep, dt, max_components, t_stop_ns, y):
