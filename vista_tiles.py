@@ -30,6 +30,8 @@ fuse_intensity       -- stitch another intensity channel of the same tiles with 
 align_blocks         -- true tile / z of every recorded z-block when Vista dropped planes, from a
                         complete reference recorded in parallel (e.g. the Olympus PMT tiles)
 find_fbs_xml         -- the Vista acquisition settings (<name>.fbs.xml) of a raw export
+find_raw             -- the raw Vista TIFF of an acquisition folder (or its name, once deleted after conversion)
+delete_raw_if_lossless -- delete the float32 raw TIFF once its uint8 tiles are verified to hold all its photons
 """
 
 import os
@@ -74,6 +76,56 @@ def find_fbs_xml(raw_path):
         if hits:
             return max(hits, key=len)
     return None
+
+
+_VISTA_STEM = re.compile(r'_Decay\d+_\d+x\d+_Z\d+_Ch\d+_T\d+_P\d+_S\d+$')
+_REPORT_DIRS = (os.path.join('analysis', 'tiles_uint8'), 'tiles_uint8')   # XYTZTime / XYTZTile layout
+
+
+def find_raw(path, report_dirs=_REPORT_DIRS):
+    """
+    The raw Vista XYTZ TIFF of an acquisition: `path` is the acquisition folder (or the raw file itself).
+
+    In the folder, the raw file is the .tif whose name ends in the Vista suffix
+    (_Decay<n>_<nx>x<ny>_Z<n>_Ch<c>_T<t>_P<p>_S<s>); outputs named after it (..._stitched_intensity.tif) are not
+    candidates. Without one (the raw file was deleted after its uint8 conversion, delete_raw_if_lossless), the name
+    comes from the conversion report below the folder (<report_dir>/<base>_conversion_report.json).
+    Returns (raw_path, exists): where the raw file is or was. Its name carries the acquisition dimensions
+    (parse_vista_name) and locates the .fbs.xml (find_fbs_xml), so both still work after the deletion.
+    FileNotFoundError when neither is found; ValueError when the folder holds several acquisitions.
+    """
+    if os.path.isfile(path):
+        return path, True
+    if path.lower().endswith(('.tif', '.tiff')):          # a raw file that is gone: its folder's report
+        folder, want = os.path.dirname(path), os.path.splitext(os.path.basename(path))[0]
+    else:
+        folder, want = path, None
+    if not os.path.isdir(folder):
+        raise FileNotFoundError(f'{path} does not exist')
+    raws = sorted(p for ext in ('*.tif', '*.tiff') for p in glob.glob(os.path.join(glob.escape(folder), ext))
+                  if _VISTA_STEM.search(os.path.splitext(os.path.basename(p))[0]))
+    reports = {}
+    for d in report_dirs:
+        for r in glob.glob(os.path.join(glob.escape(os.path.join(folder, d)), '*_conversion_report.json')):
+            reports.setdefault(os.path.basename(r)[:-len('_conversion_report.json')], r)
+    if want is not None:
+        raws = [p for p in raws if os.path.splitext(os.path.basename(p))[0] == want]
+        reports = {b: r for b, r in reports.items() if b == want}
+    if len(raws) == 1:
+        return raws[0], True
+    if len(raws) > 1:
+        raise ValueError(f'{len(raws)} raw Vista TIFFs in {folder}: '
+                         + ', '.join(os.path.basename(p) for p in raws) + ' - select the file instead')
+    if len(reports) == 1:
+        base, rep_path = next(iter(reports.items()))
+        with open(rep_path) as f:
+            ext = os.path.splitext(json.load(f).get('raw_path') or '.tif')[1] or '.tif'
+        return os.path.join(folder, base + ext), False
+    if len(reports) > 1:
+        raise ValueError(f'{len(reports)} converted acquisitions below {folder}, no raw file: '
+                         + ', '.join(sorted(reports)) + ' - give the raw file path (it may be deleted)')
+    raise FileNotFoundError(f'No raw Vista TIFF (<name>_Decay<n>_<nx>x<ny>_Z<n>_Ch1_T1_P1_S1.tif) and no uint8 '
+                            f'conversion report ({" or ".join(report_dirs)}) in {folder}')
 
 
 def _read_ifd(fh, offset):
@@ -216,6 +268,11 @@ def convert_to_uint8(raw_path, out_dir, n_pos, xy_pixel_um=None, z_step_um=None,
                 print(f'Reusing converted tiles in {out_dir}')
             return dict(tile_paths=tile_paths, tile_int=tile_int, int_path=int_path, report=report)
 
+    if not os.path.exists(raw_path):
+        _have = all(os.path.exists(p) for p in tile_paths + [int_path, rep_path])
+        raise FileNotFoundError(f'{raw_path} is gone (deleted after an earlier conversion?) and the uint8 tiles in '
+                                f'{out_dir} are ' + ('for another number of timepoints / tiles, or overwrite=True'
+                                                     if _have else 'incomplete') + ': nothing to convert from')
     layout = VistaLayout(raw_path, nbin, n_blocks, ny, nx)
     hs_kw = dict(imagej=True, metadata={'axes': 'ZCYX', 'mode': 'grayscale'})
     if z_step_um:
@@ -262,7 +319,7 @@ def convert_to_uint8(raw_path, out_dir, n_pos, xy_pixel_um=None, z_step_um=None,
                       f'photons={block_decay[p].sum():,}  -> {os.path.basename(tile_paths[p])}')
 
     tifffile.imwrite(int_path, tile_int, imagej=True, metadata={'axes': 'TZYX'})
-    report = dict(raw_path=raw_path, base=base, nbin=nbin, ny=ny, nx=nx, n_blocks=n_blocks,
+    report = dict(raw_path=raw_path, raw_bytes=os.path.getsize(raw_path), base=base, nbin=nbin, ny=ny, nx=nx, n_blocks=n_blocks,
                   n_pos=n_pos, n_t=n_t, n_z=n_z, layout=layout.summary(),
                   corrupted_pixels=int(n_corrupt),
                   corrupted_fraction=n_corrupt / float(layout.n_planes * ny * nx),
@@ -277,6 +334,57 @@ def convert_to_uint8(raw_path, out_dir, n_pos, xy_pixel_um=None, z_step_um=None,
               f'({100 * report["corrupted_fraction"]:.3f}% of all bins)  |  '
               f'residual junk: {n_residual}  |  clipped >255: {n_clipped}  |  max count {max_count:g}')
     return dict(tile_paths=tile_paths, tile_int=tile_int, int_path=int_path, report=report)
+
+
+def delete_raw_if_lossless(raw_path, conv, max_junk=100, verbose=True):
+    """
+    Delete the float32 Vista TIFF once its uint8 tiles (convert_to_uint8 result `conv`) hold all of its photons.
+
+    Deleted only when
+      - no count was clipped at 255 (report clipped_pixels == 0);
+      - at most max_junk bins held a value that is not a photon count (negative, non-integer, not finite; set to 0
+        by the conversion). Every Vista file converted up to 2026-11 has 2; a wrong byte layout gives millions.
+        Bins overwritten by Vista's stray IFDs (corrupted_pixels) are no reason to keep it: the raw file holds the
+        IFD bytes there too;
+      - the raw file is not newer than the conversion report and, for reports written since 2026-11-24, has the
+        size recorded at conversion;
+      - every uint8 tile file, read back, gives the photon count per z-block and bin recorded during the conversion.
+    The .fbs.xml and every other file stay. Returns (deleted, message).
+    """
+    rep = conv['report']
+    rep_path = os.path.join(os.path.dirname(conv['int_path']), f'{rep["base"]}_conversion_report.json')
+    if not os.path.isfile(raw_path):
+        return False, f'{raw_path} not found'
+    if os.path.splitext(os.path.basename(raw_path))[0] != rep['base']:
+        return False, f'the tiles are of {rep["base"]}, not of {os.path.basename(raw_path)}'
+    if rep.get('clipped_pixels', 1):
+        return False, f'{rep.get("clipped_pixels")} bins clipped at 255 (counts > 255 per bin and pixel)'
+    if rep.get('residual_junk_pixels', max_junk + 1) > max_junk:
+        return False, f'{rep.get("residual_junk_pixels")} bins with values that are not photon counts (> {max_junk})'
+    if os.path.getmtime(raw_path) > os.path.getmtime(rep_path):
+        return False, 'the raw file is newer than its conversion: convert again (rerun_convert = True)'
+    size = os.path.getsize(raw_path)
+    if rep.get('raw_bytes') not in (None, size):
+        return False, f'raw file has {size:,} B, {rep["raw_bytes"]:,} B at conversion'
+    if 'block_decay' not in rep:
+        return False, 'the conversion report has no per-block counts to verify the tiles: rerun_convert = True'
+    expect = np.asarray(rep['block_decay'], dtype=np.int64)          # (files, z, bin)
+    if expect.shape[0] != len(conv['tile_paths']):
+        return False, f'{len(conv["tile_paths"])} tile files, {expect.shape[0]} in the report'
+    if verbose:
+        print(f'Verifying {len(conv["tile_paths"])} uint8 tile file(s) against the conversion report...', flush=True)
+    for p, path in enumerate(conv['tile_paths']):
+        a = tifffile.memmap(path, mode='r')
+        got = np.stack([a[z].reshape(a.shape[1], -1).sum(axis=1, dtype=np.int64) for z in range(a.shape[0])])
+        del a
+        if got.shape != expect[p].shape or not np.array_equal(got, expect[p]):
+            return False, f'{os.path.basename(path)} does not hold the photons recorded at conversion: rerun_convert = True'
+    try:
+        os.remove(raw_path)
+    except OSError as e:
+        return False, f'could not delete it ({e}); is it open in another program?'
+    return True, (f'{os.path.basename(raw_path)} ({size / 1e9:.1f} GB freed): no clipped counts, '
+                  f'{rep.get("residual_junk_pixels", 0)} non-count bins, every tile file verified')
 
 
 # ── tile registration ─────────────────────────────────────────────────────────

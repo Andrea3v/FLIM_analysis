@@ -885,14 +885,17 @@ def reference_cells_table(labels, spacing):
                              centroid_x_um=com[:, 2].round(2)))
 
 
-def session_date(path):
-    """YYYY-MM-DD from a YYYYMMDD token in the path, else from the file's modification time."""
+def session_date(path, fallback=None):
+    """YYYY-MM-DD from a YYYYMMDD token in the path, else from the file's modification time, else `fallback`
+    (e.g. the .fbs.xml acquisition date when the raw file was deleted after its uint8 conversion)."""
     import re
     import datetime as _dt
     m = re.search(r'(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)', path)
     if m:
         return f'{m.group(1)}-{m.group(2)}-{m.group(3)}'
-    return _dt.datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d')
+    if os.path.exists(path):
+        return _dt.datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d')
+    return fallback
 
 
 def update_sessions(subject_dir, **entry):

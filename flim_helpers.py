@@ -8,7 +8,14 @@ uplowthresh        -- percentile-based display thresholds from pixel histogram
 Fit_decay          -- multi-exponential decay fitting (grid search + Nelder-Mead)
 fit_decays         -- Fit_decay on many decays in parallel worker processes
 pooled_lifetimes   -- intensity- / amplitude-weighted mean lifetimes of one (pooled) Fit_decay
+report_pooled_fit  -- printout + QC figure of a pooled_lifetimes result
+prepare_irf        -- the IRF of every step: clean_irf (peak to target, echoes cut) + fit_irf_width when needed
+clean_irf          -- IRF peak to the target bin, baseline 0, echoes beyond tail_ns cut
+irf_session        -- is the IRF from the data's session (.fbs.xml date and laser period)?
 fit_irf_width      -- rescale a stored IRF's width to a recording (IRF from another session)
+plot_irf_width     -- QC figure of fit_irf_width
+irf_fingerprint    -- short hash of an IRF (cache keys)
+phasor_lifetimes   -- IRF-referenced phasor G/S, tau_phi, tau_mod of decays (per cell / timepoint)
 Calc_Phasor_Mat   -- phasor G/S components + 2-D density matrix
 phasor_ref_correction -- instrument correction via known-lifetime reference standard
 read_fbs_metadata  -- parse ISS Vista .fbs.xml acquisition metadata
@@ -221,7 +228,7 @@ def Fit_decay(IRF, y, Trep, dt, max_components=3, t_stop_ns=None):
     return dt * tau_f, A_f[1:], float(A_f[0]) / n, model, chi2, model
 
 
-def pooled_lifetimes(IRF, y, Trep, dt, t_stop_ns=None, max_components=3, fast_ns=0.1, fit=None):
+def pooled_lifetimes(IRF, y, Trep, dt, t_stop_ns=None, max_components=3, fast_ns=0.05, fit=None):
     """
     Lifetime summary of one Fit_decay on a pooled decay (e.g. all cells of a z-stack or of one timepoint).
 
@@ -229,12 +236,15 @@ def pooled_lifetimes(IRF, y, Trep, dt, t_stop_ns=None, max_components=3, fast_ns
       tau_int = sum(n_i tau_i) / sum(n_i)                      intensity-weighted mean lifetime
       tau_amp = sum(a_i tau_i) / sum(a_i),  a_i = n_i (1 - exp(-dt / tau_i))   amplitude-weighted mean lifetime
     (a_i is exact for Fit_decay's periodic exponentials: a unit-amplitude one has area IRF area / (1 - exp(-dt/tau)).)
-    Components shorter than fast_ns are IRF-shaped (on the 2026-11 brain-slice data: an IRF broader than the
-    recording's); they are left out of both means and their photon share is returned as fast_frac.
+    Components shorter than fast_ns are IRF-shaped (on the 2026-11 brain-slice data, with an IRF broader than the
+    recording's, Fit_decay's fast slot went to its 0.025 ns bound); they are left out of both means and their photon
+    share is returned as fast_frac. fast_ns = 0.05 ns lies between that bound and the slot's start value (0.1 ns), so
+    a component pinned at the bound is always flagged and one that stays near its start is never split by the cutoff.
 
     fit : an existing Fit_decay result (tau, amp, off, model, chi2, ...) to summarise instead of fitting y.
-    Returns a flat dict: tau_int, tau_amp, fast_frac, chi2, tau1.. / frac1.. (slow components, sorted, photon
-    fractions of the slow photons) and model (the fitted curve).
+    Returns a flat dict: tau_int, tau_amp, fast_frac, chi2, tau1.. / frac1.. (slow components, sorted by lifetime;
+    frac = share of all photons in decay components, background excluded: frac1 + frac2 + ... + fast_frac = 1)
+    and model (the fitted curve).
     """
     if fit is None:
         fit = Fit_decay(IRF, y, Trep, dt, max_components=max_components, t_stop_ns=t_stop_ns)
@@ -242,8 +252,9 @@ def pooled_lifetimes(IRF, y, Trep, dt, t_stop_ns=None, max_components=3, fast_ns
     tau = np.asarray(tau, dtype=float).ravel()
     amp = np.clip(np.asarray(amp, dtype=float).ravel(), 0.0, None)
     slow = (tau >= fast_ns) & (amp > 0)
+    total = amp.sum()
     out = dict(tau_int=np.nan, tau_amp=np.nan,
-               fast_frac=float(amp[~slow].sum() / amp.sum()) if amp.sum() > 0 else np.nan,
+               fast_frac=float(amp[~slow].sum() / total) if total > 0 else np.nan,
                chi2=float(chi2))
     if slow.any():
         n, t = amp[slow], tau[slow]
@@ -251,12 +262,86 @@ def pooled_lifetimes(IRF, y, Trep, dt, t_stop_ns=None, max_components=3, fast_ns
         out.update(tau_int=float(n @ t / n.sum()), tau_amp=float(a @ t / a.sum()))
         for i, k in enumerate(np.argsort(t), 1):
             out[f'tau{i}'] = float(t[k])
-            out[f'frac{i}'] = float(n[k] / n.sum())
+            out[f'frac{i}'] = float(n[k] / total)
     out['model'] = np.asarray(model, dtype=float)
     return out
 
 
-def fit_irf_width(IRF, y, dt, win_ns=3.0, tail_ns=2.5, n_exp=2, s_bounds=(0.3, 2.0), min_gain=0.2):
+def report_pooled_fit(pf, tau, decay, irf, Tcycle, t_stop_ns=None, label='', png_path=None, fast_note=0.02):
+    """
+    Print the summary of a pooled_lifetimes result and draw its QC figure (fit, IRF; normalised residuals).
+    tau: time axis (ns); decay: the pooled decay; irf: the IRF of the fit; png_path: where the figure is saved.
+    """
+    comp = [(pf[f'tau{i}'], pf[f'frac{i}']) for i in range(1, 6) if np.isfinite(pf.get(f'tau{i}', np.nan))]
+    print(f'{label}: tau_int {pf["tau_int"]:.3f} ns   tau_amp {pf["tau_amp"]:.3f} ns   chi2 {pf["chi2"]:.1f}')
+    print('  components (share of photons): ' + ',  '.join(f'{t:.3f} ns ({100 * f:.0f}%)' for t, f in comp)
+          + (f',  IRF-shaped {100 * pf["fast_frac"]:.0f}%' if pf['fast_frac'] > 0.005 else ''))
+    if pf['fast_frac'] > fast_note:
+        print(f'  NOTE: {100 * pf["fast_frac"]:.0f}% of the photons are in an IRF-shaped component (< 0.05 ns, left out '
+              f'of tau_int / tau_amp): the IRF is probably broader than this recording\'s (Step 5: irf_width_mode).')
+    decay = np.asarray(decay, dtype=float)
+    pm = np.asarray(pf['model'], dtype=float)
+    fig, ax = plt.subplots(1, 2, figsize=(12, 3.8))
+    ax[0].semilogy(tau, decay / decay.max(), '.', ms=3, color='steelblue', label='pooled decay')
+    ax[0].semilogy(tau, pm / decay.max(), color='tomato', lw=1.0, label='Fit_decay')
+    ax[0].semilogy(tau, irf / irf.max(), '--k', lw=0.6, label='IRF')
+    ax[0].set(xlabel='time / ns', ylabel='intensity (norm.)', xlim=(0, Tcycle), ylim=(5e-3, 1.3))
+    ax[1].plot(tau, (decay - pm) / np.sqrt(np.maximum(pm, 1.0)), color='0.3', lw=0.8)
+    ax[1].axhline(0, color='tomato', lw=0.6)
+    ax[1].set(xlabel='time / ns', ylabel='(data − fit) / √fit', xlim=(0, Tcycle))
+    if t_stop_ns:
+        for a in ax:
+            a.axvline(t_stop_ns, color='red', ls='--', lw=0.8)
+    ax[0].legend(fontsize=8)
+    fig.suptitle(f'{label}   tau_int {pf["tau_int"]:.3f} ns,  tau_amp {pf["tau_amp"]:.3f} ns,  '
+                 f'fast {100 * pf["fast_frac"]:.1f}%,  chi2 {pf["chi2"]:.1f}', fontsize=10)
+    fig.tight_layout()
+    if png_path:
+        fig.savefig(png_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.show()
+    return fig
+
+
+# ── IRF: one preparation for every step (Step 5) ──────────────────────────────
+def irf_fingerprint(irf):
+    """Short hash of an IRF array. Stored with cached results so they are recomputed when the IRF changes."""
+    import hashlib
+    return hashlib.sha1(np.ascontiguousarray(irf, dtype=np.float64).tobytes()).hexdigest()[:12]
+
+
+def clean_irf(IRF, target, dt, tail_ns=2.5, n_base=25):
+    """
+    1-D IRF for the analysis: peak moved to bin `target` (circular shift), baseline subtracted, negatives set to 0,
+    and everything further than tail_ns from the peak (circular distance) set to 0.
+
+    The cut removes the echoes of the urea-SHG IRF recordings (~3.4 and ~4.9 ns after the peak; the slice decays
+    have none) and the noise of the IRF's baseline. Baseline: median of the bins beyond tail_ns (robust to the
+    echoes). tail_ns=None keeps the IRF as measured, baseline = median of the last n_base bins after the shift.
+    """
+    ir = np.asarray(IRF, dtype=float).ravel()
+    n = ir.size
+    ir = np.roll(ir, int(target) - int(np.argmax(ir)))
+    if tail_ns is None:
+        return np.clip(ir - np.median(ir[-n_base:]), 0.0, None)
+    far = np.abs((np.arange(n) - int(target) + n // 2) % n - n // 2) > tail_ns / dt
+    ir = ir - np.median(ir[far])
+    ir[far] = 0.0
+    return np.clip(ir, 0.0, None)
+
+
+def irf_session(meta_irf, meta, tol_ns=0.01):
+    """(same_session, reason): the IRF is from the data's session when both .fbs.xml exist with the same date and
+    laser period (within tol_ns)."""
+    d_irf = ((meta_irf or {}).get('datetime') or '')[:10]
+    d_dat = ((meta or {}).get('datetime') or '')[:10]
+    same = bool(d_irf and d_irf == d_dat
+                and abs(((meta_irf or {}).get('Tcycle') or 0) - ((meta or {}).get('Tcycle') or 0)) < tol_ns)
+    why = ('IRF from the same session (.fbs.xml dates and laser period match)' if same else
+           'IRF has no .fbs.xml' if not meta_irf else f'IRF of {d_irf or "?"}, data of {d_dat or "?"}')
+    return same, why
+
+
+def fit_irf_width(IRF, y, dt, win_ns=3.0, n_exp=2, s_bounds=(0.3, 2.0), min_gain=0.2):
     """
     Rescale the width of a stored IRF to the instrument response of a recording.
 
@@ -269,16 +354,15 @@ def fit_irf_width(IRF, y, dt, win_ns=3.0, tail_ns=2.5, n_exp=2, s_bounds=(0.3, 2
         y = background + sum_k A_k * (IRF_s,c  (x) periodic exp(-t / tau_k)),   k = 1..n_exp
     with IRF_s,c the IRF stretched in time by s about its (sub-bin) peak and shifted by c bins. The lifetimes, A_k
     and the background are nuisance parameters (A by NNLS); s, c and tau_k by Nelder-Mead from several starts.
-    The IRF is first cut to +-tail_ns around its peak (removes its echoes and baseline). The same fit with s = 1
-    gives the chi2 of the measured IRF.
+    The same fit with s = 1 gives the chi2 of the IRF as given.
 
-    IRF, y : 1-D, same bins (dt ns), peaks near each other (e.g. both aligned to the same target bin).
+    IRF : 1-D, prepared by clean_irf (baseline 0, echoes cut); y : 1-D, same bins (dt ns), peaks near each other.
     Returns dict:
         s, c                       : width factor (< 1: narrower) and shift (bins) of the best fit
         chi2_measured, chi2_fitted : reduced Pearson chi2 with s = 1 and with the fitted s
         apply                      : chi2_fitted < (1 - min_gain) * chi2_measured
         irf                        : the IRF rescaled by s about its own peak (shift NOT applied), same area
-        irf_measured               : the cut IRF with s = 1
+        irf_measured               : the IRF as given (s = 1)
         stop                       : fit window = bins [0, stop)
         model_measured, model_fitted : fitted curves (full length) for a QC plot
         taus                       : nuisance lifetimes (ns) of the fitted model
@@ -286,20 +370,17 @@ def fit_irf_width(IRF, y, dt, win_ns=3.0, tail_ns=2.5, n_exp=2, s_bounds=(0.3, 2
     y = np.asarray(y, dtype=float).ravel()
     n = y.size
     T = np.arange(n, dtype=float)
-    ir = np.asarray(IRF, dtype=float).ravel()[:n].copy()
-    ir -= np.median(ir[-25:])
+    ir = np.asarray(IRF, dtype=float).ravel()
+    if ir.size != n:
+        raise ValueError(f'IRF has {ir.size} bins, the data {n}')
     pk = int(np.argmax(ir))
-    ir[np.abs(T - pk) > tail_ns / dt] = 0.0
-    ir = np.clip(ir, 0.0, None)
     a, b, c3 = ir[pk - 1], ir[pk], ir[(pk + 1) % n]
     den = a - 2 * b + c3
     tpk = pk + (0.5 * (a - c3) / den if den != 0 else 0.0)        # sub-bin peak (parabola through the top 3 bins)
-    fine = np.arange(n * 10) / 10.0
-    src = np.interp(fine, T, ir)
     area = ir.sum()
 
     def irf_sc(s, c):
-        out = np.interp((T - tpk - c) / s + tpk, fine, src, left=0.0, right=0.0)
+        out = np.interp((T - tpk - c) / s + tpk, T, ir, left=0.0, right=0.0)
         return out * (area / out.sum()) if out.sum() > 0 else out
 
     stop = min(n, int(np.argmax(y)) + int(round(win_ns / dt)) + 1)
@@ -343,8 +424,73 @@ def fit_irf_width(IRF, y, dt, win_ns=3.0, tail_ns=2.5, n_exp=2, s_bounds=(0.3, 2
     f, m = res['fitted'], res['measured']
     return dict(s=f['s'], c=f['c'], chi2_measured=m['chi2'], chi2_fitted=f['chi2'],
                 apply=bool(f['chi2'] < (1.0 - min_gain) * m['chi2']),
-                irf=irf_sc(f['s'], 0.0), irf_measured=ir, stop=stop,
+                irf=irf_sc(f['s'], 0.0), irf_measured=ir.copy(), stop=stop,
                 model_measured=m['model'], model_fitted=f['model'], taus=f['taus'])
+
+
+def prepare_irf(IRF, y, dt, target, tail_ns=2.5, width_mode='auto', same_session=False, win_ns=3.0, min_gain=0.2):
+    """
+    The IRF used by every later step (tav reference H, phasor reference, all fits), built in one place from the IRF
+    as loaded. The input is never modified, so re-running gives the same result until another IRF is loaded.
+      1. clean_irf: peak -> bin target, baseline 0, 0 beyond tail_ns from the peak (the IRF recording's echoes)
+      2. width: fit_irf_width when width_mode == 'always', or 'auto' and not same_session; the rescaled IRF is used
+         when chi2 drops by more than min_gain (20 %). 'off': never.
+    y : data decay with its peak at bin `target`.
+    Returns dict: irf (to use), irf_clean, width (fit_irf_width result, or None when not fitted),
+    key (irf_fingerprint of irf).
+    """
+    irf_c = clean_irf(IRF, target, dt, tail_ns=tail_ns)
+    width = None
+    if width_mode == 'always' or (width_mode == 'auto' and not same_session):
+        width = fit_irf_width(irf_c, y, dt, win_ns=win_ns, min_gain=min_gain)
+    irf = width['irf'] if width is not None and width['apply'] else irf_c
+    return dict(irf=irf, irf_clean=irf_c, width=width, key=irf_fingerprint(irf))
+
+
+def plot_irf_width(width, tau, y, target, win_ns, title=''):
+    """QC figure of fit_irf_width: rising edge (IRF as given, rescaled IRF, data); residuals of both fits."""
+    w = width
+    nbin = len(tau)
+    fig, ax = plt.subplots(1, 2, figsize=(12, 3.6))
+    ax[0].plot(tau, w['irf_measured'] / w['irf_measured'].max(), '--k', lw=1, label='IRF (echoes cut)')
+    ax[0].plot(tau, w['irf'] / w['irf'].max(), color='C3', lw=1.2, label=f'IRF x {w["s"]:.2f} (width)')
+    ax[0].plot(tau, y / y.max(), '.', color='steelblue', ms=4, label='data (middle plane)')
+    ax[0].set(xlim=(tau[max(target - 6, 0)], tau[min(target + 25, nbin - 1)]), xlabel='time / ns',
+              ylabel='intensity (norm.)', title='rising edge')
+    st = w['stop']
+    for m, col, lbl in ((w['model_measured'], 'k', 'IRF as measured'), (w['model_fitted'], 'C3', 'rescaled IRF')):
+        ax[1].plot(tau[:st], ((y - m) / np.sqrt(np.maximum(m, 1.0)))[:st], color=col, lw=1, label=lbl)
+    ax[1].axhline(0, color='0.6', lw=0.5)
+    ax[1].set(xlabel='time / ns', ylabel='(data − model) / √model', title=f'fit window: to {win_ns} ns after the peak')
+    for a in ax:
+        a.legend(fontsize=8)
+    fig.suptitle(f'IRF width  {title}   factor {w["s"]:.3f},  chi2 {w["chi2_measured"]:.0f} → {w["chi2_fitted"]:.0f}'
+                 + ('' if w['apply'] else '   (not applied)'), fontsize=10)
+    fig.tight_layout()
+    plt.show()
+    return fig
+
+
+def phasor_lifetimes(decays, IRF, dt, Trep, min_photons=1):
+    """
+    Phasor of decays (one per row), referenced to the IRF as in Step 11: phase 0 at the IRF's mean arrival time,
+    the IRF's own phasor mapped to (1, 0) (phasor_ref_correction with a 0 ns reference).
+    Returns G, S, tau_phi (phase lifetime S / (ωG): needs only the IRF timing) and tau_mod (modulation lifetime:
+    depends on the IRF width), in ns; NaN for rows with fewer than min_photons.
+    """
+    D = np.atleast_2d(np.asarray(decays, dtype=float))
+    irf = np.asarray(IRF, dtype=float).ravel()
+    tp = (np.arange(1, D.shape[1] + 1) - 0.5) * dt
+    T = 2.0 * np.pi * (tp - tp @ irf / irf.sum()) / Trep
+    nph = D.sum(axis=1)
+    ok = nph >= max(min_photons, 1)
+    w = D / np.maximum(nph, 1.0)[:, np.newaxis]
+    g = np.where(ok, w @ np.cos(T), np.nan)
+    s = np.where(ok, w @ np.sin(T), np.nan)
+    G, S, tau_mod, tau_phi = phasor_ref_correction(
+        g, s, np.array([[np.cos(T) @ irf / irf.sum()]]), np.array([[np.sin(T) @ irf / irf.sum()]]),
+        tau_ref_ns=0.0, freq_mhz=1000.0 / Trep)
+    return G, S, tau_phi, tau_mod
 
 
 def _fit_row(IRF, Trep, dt, max_components, t_stop_ns, y):
