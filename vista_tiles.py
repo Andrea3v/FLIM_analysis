@@ -828,8 +828,9 @@ def fuse_tiles(tile_paths, reg, tile_int, out_dir, base, overwrite=False, verbos
 
 def move_legacy_outputs(raw_dir, base, out_dir, int_dir, tp_dir, verbose=True):
     """
-    Move the Step-0 outputs that older versions of the time-lapse notebook wrote loose into the raw
-    folder into the grouped layout (AnalyzeTCSPC_XYTZTime.ipynb):
+    Move the Step-0 outputs that older versions of the XYTZ notebooks wrote loose into the raw folder
+    into the grouped layout (AnalyzeTCSPC_XYTZTime.ipynb since 2026-11-18, AnalyzeTCSPC_XYTZTile.ipynb
+    since 2026-11-24):
         tiles_uint8/<base>_*                                  -> <out_dir>/tiles_uint8/
         <base>_tile_positions.json, <base>_block_map.json     -> <out_dir>/
         <base>[_T<tt>]_stitched_intensity.tif, <base>[_T<tt>]_coverage.tif,
